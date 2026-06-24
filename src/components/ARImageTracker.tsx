@@ -4,7 +4,8 @@ import { MindARThree } from 'mind-ar/dist/mindar-image-three.prod.js';
 
 type TrackingStatus = 'idle' | 'starting' | 'scanning' | 'found' | 'error';
 
-const TARGET_SRC = '/targets/targets.mind';
+// 用 BASE_URL 組路徑，部署到 GitHub Pages 子路徑（/ARResearch/）時才抓得到
+const TARGET_SRC = `${import.meta.env.BASE_URL}targets/targets.mind`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
