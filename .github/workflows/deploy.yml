@@ -23,7 +23,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # mind-ar 依賴的原生模組 canvas 在 CI 上不需要（瀏覽器執行時用不到），
       # 跳過 install 腳本避免編譯失敗，再手動補上 esbuild 的平台 binary。
