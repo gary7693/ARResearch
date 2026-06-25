@@ -2,10 +2,38 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { MindARThree } from 'mind-ar/dist/mindar-image-three.prod.js';
 
-type TrackingStatus = 'idle' | 'starting' | 'scanning' | 'found' | 'error';
+type TrackingStatus = 'idle' | 'starting' | 'scanning' | 'error';
 
 // 用 BASE_URL 組路徑，部署到 GitHub Pages 子路徑（/ARResearch/）時才抓得到
 const TARGET_SRC = `${import.meta.env.BASE_URL}targets/targets.mind`;
+
+/**
+ * 多目標設定：每個 index 對應 targets.mind 裡的第幾張圖（從 0 起），
+ * 各自顯示不同的 3D 物件。要增減目標時，編輯這個陣列並重新編譯 targets.mind 即可。
+ */
+type TargetConfig = {
+  index: number;
+  name: string;
+  /** 每次啟動建立全新的 mesh，避免顏色等狀態跨次殘留 */
+  create: () => THREE.Mesh;
+};
+
+function makeMesh(geometry: THREE.BufferGeometry, color: number): THREE.Mesh {
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    metalness: 0.3,
+    roughness: 0.4,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.set(0, 0, 0.3);
+  return mesh;
+}
+
+const TARGETS: TargetConfig[] = [
+  { index: 0, name: '立方體', create: () => makeMesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), 0x7df9ff) },
+  { index: 1, name: '甜甜圈', create: () => makeMesh(new THREE.TorusGeometry(0.35, 0.14, 20, 48), 0xff9f7d) },
+  { index: 2, name: '球體', create: () => makeMesh(new THREE.SphereGeometry(0.4, 32, 32), 0xb07dff) },
+];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -117,11 +145,13 @@ function describeCameraError(err: unknown): string {
 export default function ARImageTracker() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mindarRef = useRef<MindARThree | null>(null);
-  const objectRef = useRef<THREE.Mesh | null>(null);
+  // 所有目標的 mesh，供動畫旋轉與點擊偵測
+  const objectsRef = useRef<THREE.Mesh[]>([]);
 
   const [status, setStatus] = useState<TrackingStatus>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [tapCount, setTapCount] = useState(0);
+  const [foundIndices, setFoundIndices] = useState<number[]>([]);
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('');
 
@@ -154,15 +184,17 @@ export default function ARImageTracker() {
     mindar.renderer.setAnimationLoop(null);
     mindar.stop();
     mindarRef.current = null;
-    objectRef.current = null;
+    objectsRef.current = [];
     setStatus('idle');
     setTapCount(0);
+    setFoundIndices([]);
   }, []);
 
   const start = useCallback(async () => {
     if (!containerRef.current || mindarRef.current) return;
     setStatus('starting');
     setErrorMsg('');
+    setFoundIndices([]);
 
     try {
       // 先自行取得相機，遇到問題能顯示真正原因（MindAR 會吞掉錯誤）
@@ -175,6 +207,8 @@ export default function ARImageTracker() {
         imageTargetSrc: TARGET_SRC,
         uiScanning: false,
         uiLoading: false,
+        // 同時最多追蹤的目標數量：設為目標總數，才能多張一起顯示
+        maxTrack: TARGETS.length,
         // 預設 shouldFaceUser 為 false，會採用 environmentDeviceId 指定的相機
         environmentDeviceId: selectedDeviceId || null,
       });
@@ -188,24 +222,26 @@ export default function ARImageTracker() {
       dirLight.position.set(1, 1, 1);
       scene.add(dirLight);
 
-      // 目標 0 對應的錨點：偵測到圖片時會顯示其 group 內的物件
-      const anchor = mindar.addAnchor(0);
+      // 為每個目標建立錨點與專屬 3D 物件
+      const interactiveMeshes: THREE.Mesh[] = [];
+      for (const target of TARGETS) {
+        const anchor = mindar.addAnchor(target.index);
+        const mesh = target.create();
+        anchor.group.add(mesh);
+        interactiveMeshes.push(mesh);
 
-      const geometry = new THREE.BoxGeometry(0.6, 0.6, 0.6);
-      const material = new THREE.MeshStandardMaterial({
-        color: 0x7df9ff,
-        metalness: 0.3,
-        roughness: 0.4,
-      });
-      const cube = new THREE.Mesh(geometry, material);
-      cube.position.set(0, 0, 0.3);
-      anchor.group.add(cube);
-      objectRef.current = cube;
+        anchor.onTargetFound = () =>
+          setFoundIndices((prev) =>
+            prev.includes(target.index)
+              ? prev
+              : [...prev, target.index].sort((a, b) => a - b),
+          );
+        anchor.onTargetLost = () =>
+          setFoundIndices((prev) => prev.filter((i) => i !== target.index));
+      }
+      objectsRef.current = interactiveMeshes;
 
-      anchor.onTargetFound = () => setStatus('found');
-      anchor.onTargetLost = () => setStatus('scanning');
-
-      // 點擊互動：用 raycaster 判斷是否點到 3D 物件
+      // 點擊互動：用 raycaster 對所有目標物件做命中判斷，點到就換色
       const raycaster = new THREE.Raycaster();
       const pointer = new THREE.Vector2();
       const handleTap = (event: PointerEvent) => {
@@ -213,9 +249,10 @@ export default function ARImageTracker() {
         pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
         pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
         raycaster.setFromCamera(pointer, camera);
-        const hits = raycaster.intersectObject(cube, true);
-        if (hits.length > 0) {
-          material.color.setHSL(Math.random(), 0.7, 0.6);
+        const hits = raycaster.intersectObjects(objectsRef.current, true);
+        const mat = hits[0]?.object && (hits[0].object as THREE.Mesh).material;
+        if (mat instanceof THREE.MeshStandardMaterial) {
+          mat.color.setHSL(Math.random(), 0.7, 0.6);
           setTapCount((c) => c + 1);
         }
       };
@@ -225,10 +262,10 @@ export default function ARImageTracker() {
       setStatus('scanning');
 
       renderer.setAnimationLoop(() => {
-        // 持續旋轉，營造互動感
-        if (objectRef.current) {
-          objectRef.current.rotation.y += 0.02;
-          objectRef.current.rotation.x += 0.005;
+        // 所有目標物件持續旋轉，營造互動感
+        for (const mesh of objectsRef.current) {
+          mesh.rotation.y += 0.02;
+          mesh.rotation.x += 0.005;
         }
         renderer.render(scene, camera);
       });
@@ -258,15 +295,19 @@ export default function ARImageTracker() {
   // 元件卸載時確保釋放相機資源
   useEffect(() => stop, [stop]);
 
-  const statusText: Record<TrackingStatus, string> = {
-    idle: '尚未啟動',
-    starting: '啟動相機中…',
-    scanning: '請將鏡頭對準目標圖片',
-    found: '✅ 已偵測到目標！點擊立方體換色',
-    error: `錯誤：${errorMsg}`,
-  };
-
   const running = status !== 'idle' && status !== 'error';
+  const foundNames = foundIndices
+    .map((i) => TARGETS.find((t) => t.index === i)?.name)
+    .filter(Boolean)
+    .join('、');
+
+  let mainStatus: string;
+  if (status === 'error') mainStatus = `錯誤：${errorMsg}`;
+  else if (status === 'idle') mainStatus = '尚未啟動';
+  else if (status === 'starting') mainStatus = '啟動相機中…';
+  else if (foundIndices.length > 0)
+    mainStatus = `✅ 偵測到 ${foundIndices.length} 個：${foundNames}（點擊物件換色）`;
+  else mainStatus = '請將鏡頭對準目標圖片';
 
   return (
     <>
@@ -277,7 +318,7 @@ export default function ARImageTracker() {
           <span
             className={`ar-badge ar-status${status === 'error' ? ' ar-status--error' : ''}`}
           >
-            {statusText[status]}
+            {mainStatus}
           </span>
           {tapCount > 0 && <span className="ar-badge">點擊次數：{tapCount}</span>}
 
